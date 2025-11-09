@@ -8,4 +8,4 @@ google-genai==1.49.0
 google-cloud-storage==3.5.0
 requests==2.32.5
 regex==2025.11.3
-python-multipart 0.0.20
+python-multipart==0.0.20
