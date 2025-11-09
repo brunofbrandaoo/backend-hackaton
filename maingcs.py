@@ -4,7 +4,7 @@ import io
 import json
 import base64
 import logging
-from typing import List, Optional, Literal, Dict, Any
+from typing import List, Optional, Literal, Dict, Any, Literal
 import re
 
 import fitz  # PyMuPDF
@@ -744,6 +744,12 @@ class GradeResp(BaseModel):
     saved: bool = False
     submission: Optional[dict] = None
 
+class QuestionsListResp(BaseModel):
+    items: List[QuestionOut]
+    total: int
+    limit: int
+    offset: int
+
 
 # ==== FASTAPI APP ====
 app = FastAPI(
@@ -1218,4 +1224,84 @@ def grade_from_gcs(req: GradeReqGCS):
         raise
     except Exception as e:
         log.exception("Erro em /grading/grade/gcs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/questions", response_model=QuestionsListResp)
+def list_questions(
+    subject_id: Optional[str] = Query(None),
+    created_by: Optional[str] = Query(None),
+    available: Optional[bool] = Query(None),
+    difficulty: Optional[str] = Query(None),
+    topic: Optional[str] = Query(None, description="Filtra por question.topic (JSON)"),
+    search: Optional[str] = Query(None, description="Busca no enunciado/JSON da questão"),
+    order_by: Literal["created_at", "id"] = Query("created_at"),
+    order: Literal["asc", "desc"] = Query("desc"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Lista questões com filtros e paginação.
+
+    Filtros:
+      - available: True/False
+      - subject_id, created_by, difficulty
+      - topic: faz match em question.topic (JSON)
+      - search: busca textual em question->>statement e/ou question::text
+
+    Ordenação:
+      - order_by: created_at (default) ou id
+      - order: asc/desc (default desc)
+    """
+    try:
+        sb = _sb()
+
+        # select com count para paginação
+        q = sb.table("questions").select("*", count="exact")
+
+        if available is not None:
+            q = q.eq("available", available)
+        if subject_id:
+            q = q.eq("subject_id", subject_id)
+        if created_by:
+            q = q.eq("created_by", created_by)
+        if difficulty:
+            q = q.eq("difficulty", difficulty)
+        if topic:
+            # topic armazenado dentro do JSONB 'question'
+            # usa contains para match exato do campo
+            q = q.contains("question", {"topic": topic})
+        if search:
+            # Busca no enunciado (question->>statement) OU no JSON inteiro (question::text)
+            # Observação: o operador or_ do supabase-py aceita a sintaxe PostgREST.
+            pattern = f"%{search}%"
+            q = q.or_(
+                f"question->>statement.ilike.{pattern},question.ilike.{pattern}"
+            )
+
+        # ordenação
+        try:
+            q = q.order(order_by, desc=(order == "desc"))
+        except Exception:
+            # fallback se a coluna não existir
+            q = q.order("id", desc=(order == "desc"))
+
+        # paginação
+        if offset:
+            q = q.range(offset, offset + limit - 1)
+        else:
+            q = q.limit(limit)
+
+        res = q.execute()
+        items = res.data or []
+        total = getattr(res, "count", None)
+        # se a versão do client não retornar count aqui, dá pra fazer um SELECT separado com count="exact" sem range.
+
+        return QuestionsListResp(
+            items=items,
+            total=total if isinstance(total, int) else len(items),
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        log.exception("Erro em GET /questions")
         raise HTTPException(status_code=500, detail=str(e))
