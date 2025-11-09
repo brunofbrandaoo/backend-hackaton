@@ -758,7 +758,7 @@ class SubjectsListResp(BaseModel):
     offset: int
 
 class AttemptCreate(BaseModel):
-    question_id: str
+    question_id: Optional[str] = None
     selected_letter: Optional[str] = Field(None, pattern="^[A-Ea-e]$")
     student_id: Optional[str] = None  # se tiver login/identidade
     # opcional: permitir override de materia/subject se vier do front
@@ -1486,7 +1486,7 @@ def create_attempt(body: AttemptCreate):
         }
 
         # 4️⃣ Inserir tentativa
-        ins = sb.table("question_attempts").insert(payload).select("*").execute()
+        ins = sb.table("question_attempts").insert(payload, returning="representation").execute()
         created = (ins.data or [None])[0]
         if not created:
             raise HTTPException(status_code=500, detail="Falha ao salvar tentativa.")
@@ -1604,8 +1604,9 @@ def create_question(body: QuestionCreateReq):
             # se sua tabela tiver 'topic_ids' (array) ou 'topic_id' (único), ajuste abaixo:
             payload["topic_ids"] = body.topic_ids  # comente se não tiver essa coluna
 
-        res = sb.table("questions").insert(payload).select("id").execute()
+        res = sb.table("questions").insert(payload, returning="representation").execute()
         row = (res.data or [None])[0]
+
         if not row:
             raise HTTPException(status_code=500, detail="Insert failed.")
 
