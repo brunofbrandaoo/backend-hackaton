@@ -757,6 +757,34 @@ class SubjectsListResp(BaseModel):
     limit: int
     offset: int
 
+class AttemptCreate(BaseModel):
+    question_id: str
+    selected_letter: Optional[str] = Field(None, pattern="^[A-Ea-e]$")
+    student_id: Optional[str] = None  # se tiver login/identidade
+    # opcional: permitir override de materia/subject se vier do front
+    materia: Optional[str] = None
+    subject_id: Optional[str] = None
+
+class AttemptOut(BaseModel):
+    id: Any
+    student_id: Optional[str]
+    question_id: str
+    subject_id: Optional[str]
+    materia: Optional[str]
+    question_statement: str
+    alternatives: Dict[str, Any]
+    correct_letter: str
+    selected_letter: Optional[str]
+    is_correct: bool
+    attempted_at: datetime
+
+class AttemptsListResp(BaseModel):
+    items: List[AttemptOut]
+    total: int
+    limit: int
+    offset: int
+
+
 
 # ==== FASTAPI APP ====
 app = FastAPI(
@@ -1377,4 +1405,107 @@ def list_subjects(
     except Exception as e:
         log.exception("Erro em GET /subjects")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
+@app.post("/attempts", response_model=AttemptOut)
+def create_attempt(body: AttemptCreate):
+    try:
+        sb = _sb()
+
+        # 1) Buscar a questão
+        qres = sb.table("questions").select("*").eq("id", body.question_id).limit(1).execute()
+        row = (qres.data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=404, detail="Questão não encontrada.")
+
+        qobj = row.get("question") or {}
+        statement = (qobj or {}).get("statement") or ""
+        alts = (qobj or {}).get("alternatives") or []
+        correct = (qobj or {}).get("correct_answer") or ""
+        if not statement or not alts or not correct:
+            raise HTTPException(status_code=422, detail="Questão sem dados suficientes (enunciado/alternativas/gabarito).")
+
+        # 2) Normalizar letras
+        selected = (body.selected_letter or "").strip().upper() or None
+        correct = (correct or "").strip().upper()
+
+        if selected is not None and selected not in {"A","B","C","D","E"}:
+            raise HTTPException(status_code=422, detail="selected_letter inválida (A..E).")
+        if correct not in {"A","B","C","D","E"}:
+            raise HTTPException(status_code=422, detail="correct_answer inválida na questão (A..E).")
+
+        # 3) Snapshot de subject/materia (ou usa o que veio do body)
+        subject_id = body.subject_id or row.get("subject_id")
+        materia = body.materia or row.get("materia")
+
+        payload = {
+            "student_id": body.student_id,
+            "question_id": body.question_id,
+            "subject_id": subject_id,
+            "materia": materia,
+            "question_statement": statement,
+            "alternatives": alts,
+            "correct_letter": correct,
+            "selected_letter": selected,
+            # is_correct é GENERATED, não precisa mandar
+        }
+
+        ins = sb.table("question_attempts").insert(payload).select("*").execute()
+        created = (ins.data or [None])[0]
+        if not created:
+            raise HTTPException(status_code=500, detail="Falha ao salvar tentativa.")
+
+        return created
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Erro em POST /attempts")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/attempts", response_model=AttemptsListResp)
+def list_attempts(
+    student_id: Optional[str] = Query(None),
+    question_id: Optional[str] = Query(None),
+    subject_id: Optional[str] = Query(None),
+    materia: Optional[str] = Query(None),
+    is_correct: Optional[bool] = Query(None),
+    order_by: Literal["attempted_at","id"] = Query("attempted_at"),
+    order: Literal["asc","desc"] = Query("desc"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    try:
+        sb = _sb()
+        q = sb.table("question_attempts").select("*", count="exact")
+
+        if student_id:
+            q = q.eq("student_id", student_id)
+        if question_id:
+            q = q.eq("question_id", question_id)
+        if subject_id:
+            q = q.eq("subject_id", subject_id)
+        if materia:
+            q = q.eq("materia", materia)
+        if is_correct is not None:
+            q = q.eq("is_correct", is_correct)
+
+        try:
+            q = q.order(order_by, desc=(order == "desc"))
+        except Exception:
+            q = q.order("id", desc=(order == "desc"))
+
+        if offset:
+            q = q.range(offset, offset + limit - 1)
+        else:
+            q = q.limit(limit)
+
+        res = q.execute()
+        items = res.data or []
+        total = getattr(res, "count", None)
+
+        return AttemptsListResp(
+            items=items, total=total if isinstance(total, int) else len(items),
+            limit=limit, offset=offset
+        )
+    except Exception as e:
+        log.exception("Erro em GET /attempts")
+        raise HTTPException(status_code=500, detail=str(e))
