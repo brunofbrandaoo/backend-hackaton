@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+PyMuPDF
+pydantic
+supabase
+google-genai
+google-cloud-storage
+requests
