@@ -784,6 +784,33 @@ class AttemptsListResp(BaseModel):
     limit: int
     offset: int
 
+# ---- BATCH ----
+class QuestionsBatchReq(BaseModel):
+    question_ids: List[str] = Field(..., min_items=1, description="Lista de IDs de questões")
+
+class QuestionsItemsResp(BaseModel):
+    items: List[QuestionOut]
+
+# ---- CREATE QUESTION ----
+class QuestionAlternative(BaseModel):
+    text: str
+    letter: Literal["A","B","C","D","E"]
+
+class QuestionCreateReq(BaseModel):
+    statement: str
+    alternatives: List[QuestionAlternative] = Field(..., min_items=2, max_items=5)
+    correct_answer: Literal["A","B","C","D","E"]
+    subject_id: Optional[str] = None
+    topic_ids: Optional[List[str]] = None   # se existir no seu schema; ignora se não tiver
+    difficulty: Literal["facil","medio","dificil"] = "medio"
+    created_by: Optional[str] = None
+    materia: Optional[str] = None           # opcional, se você tiver essa coluna
+
+class QuestionCreateResp(BaseModel):
+    id: Any
+    message: str = "Question created successfully"
+
+
 
 
 # ==== FASTAPI APP ====
@@ -1408,58 +1435,70 @@ def list_subjects(
 
 @app.post("/attempts", response_model=AttemptOut)
 def create_attempt(body: AttemptCreate):
+    """
+    Cria um registro de tentativa (question_attempts).
+    Permite POST mesmo sem student_id, subject_id ou materia.
+    """
     try:
         sb = _sb()
 
-        # 1) Buscar a questão
-        qres = sb.table("questions").select("*").eq("id", body.question_id).limit(1).execute()
-        row = (qres.data or [None])[0]
-        if not row:
-            raise HTTPException(status_code=404, detail="Questão não encontrada.")
+        statement = None
+        alts = []
+        correct = None
 
-        qobj = row.get("question") or {}
-        statement = (qobj or {}).get("statement") or ""
-        alts = (qobj or {}).get("alternatives") or []
-        correct = (qobj or {}).get("correct_answer") or ""
-        if not statement or not alts or not correct:
-            raise HTTPException(status_code=422, detail="Questão sem dados suficientes (enunciado/alternativas/gabarito).")
+        # 1️⃣ Buscar a questão se tiver question_id
+        if body.question_id:
+            qres = sb.table("questions").select("*").eq("id", body.question_id).limit(1).execute()
+            row = (qres.data or [None])[0]
 
-        # 2) Normalizar letras
+            if row:
+                qobj = row.get("question") or {}
+                statement = (qobj or {}).get("statement") or None
+                alts = (qobj or {}).get("alternatives") or []
+                correct = (qobj or {}).get("correct_answer") or None
+
+                # fallback para subject/materia
+                if not body.subject_id:
+                    body.subject_id = row.get("subject_id")
+                if not body.materia:
+                    body.materia = row.get("materia")
+
+        # 2️⃣ Normalizar as letras (corrige se não existir)
         selected = (body.selected_letter or "").strip().upper() or None
-        correct = (correct or "").strip().upper()
-
-        if selected is not None and selected not in {"A","B","C","D","E"}:
+        if selected and selected not in {"A", "B", "C", "D", "E"}:
             raise HTTPException(status_code=422, detail="selected_letter inválida (A..E).")
-        if correct not in {"A","B","C","D","E"}:
-            raise HTTPException(status_code=422, detail="correct_answer inválida na questão (A..E).")
 
-        # 3) Snapshot de subject/materia (ou usa o que veio do body)
-        subject_id = body.subject_id or row.get("subject_id")
-        materia = body.materia or row.get("materia")
+        if correct:
+            correct = (correct or "").strip().upper()
+            if correct not in {"A", "B", "C", "D", "E"}:
+                correct = None
 
+        # 3️⃣ Criar payload (com defaults seguros)
         payload = {
-            "student_id": body.student_id,
-            "question_id": body.question_id,
-            "subject_id": subject_id,
-            "materia": materia,
-            "question_statement": statement,
-            "alternatives": alts,
-            "correct_letter": correct,
+            "student_id": body.student_id or None,
+            "question_id": body.question_id or None,
+            "subject_id": body.subject_id or None,
+            "materia": body.materia or "Geral",
+            "question_statement": statement or "Questão não especificada",
+            "alternatives": alts or [],
+            "correct_letter": correct or "A",  # evita null se faltar
             "selected_letter": selected,
-            # is_correct é GENERATED, não precisa mandar
         }
 
+        # 4️⃣ Inserir tentativa
         ins = sb.table("question_attempts").insert(payload).select("*").execute()
         created = (ins.data or [None])[0]
         if not created:
             raise HTTPException(status_code=500, detail="Falha ao salvar tentativa.")
 
         return created
+
     except HTTPException:
         raise
     except Exception as e:
         log.exception("Erro em POST /attempts")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/attempts", response_model=AttemptsListResp)
 def list_attempts(
@@ -1509,3 +1548,126 @@ def list_attempts(
     except Exception as e:
         log.exception("Erro em GET /attempts")
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/questions/batch", response_model=QuestionsItemsResp)
+def get_questions_batch(body: QuestionsBatchReq):
+    try:
+        sb = _sb()
+        ids = [x for x in (body.question_ids or []) if x]
+        if not ids:
+            return QuestionsItemsResp(items=[])
+
+        res = sb.table("questions").select("*").in_("id", ids).execute()
+        rows = res.data or []
+
+        # Reordena na ordem requisitada
+        pos = {qid: i for i, qid in enumerate(ids)}
+        rows.sort(key=lambda r: pos.get(r.get("id"), 10**9))
+
+        return QuestionsItemsResp(items=rows)
+    except Exception as e:
+        log.exception("Erro em POST /questions/batch")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/questions", response_model=QuestionCreateResp)
+def create_question(body: QuestionCreateReq):
+    try:
+        sb = _sb()
+
+        # Valida alternativas: letras únicas
+        letters = [a.letter for a in body.alternatives]
+        if len(set(letters)) != len(letters):
+            raise HTTPException(status_code=422, detail="Letters in alternatives must be unique.")
+
+        # Normaliza dificuldade (se usar en no banco)
+        diff_map = {"facil": "easy", "medio": "medium", "médio": "medium", "dificil": "hard", "difícil": "hard"}
+        difficulty_db = diff_map.get(body.difficulty.lower(), body.difficulty)
+
+        question_jsonb = {
+            "statement": body.statement,
+            "alternatives": [a.model_dump() for a in body.alternatives],
+            "correct_answer": body.correct_answer,
+        }
+
+        payload = {
+            "subject_id": body.subject_id,
+            "created_by": body.created_by,
+            "difficulty": difficulty_db,
+            "available": False,           # começa como pendente para revisão, ajuste se quiser
+            "question": question_jsonb,
+        }
+
+        # Campos opcionais se existirem na sua tabela
+        if hasattr(payload, "materia") or "materia" in (sb.table("questions").schema if hasattr(sb.table("questions"), "schema") else {}):
+            payload["materia"] = body.materia
+        if body.topic_ids:
+            # se sua tabela tiver 'topic_ids' (array) ou 'topic_id' (único), ajuste abaixo:
+            payload["topic_ids"] = body.topic_ids  # comente se não tiver essa coluna
+
+        res = sb.table("questions").insert(payload).select("id").execute()
+        row = (res.data or [None])[0]
+        if not row:
+            raise HTTPException(status_code=500, detail="Insert failed.")
+
+        return QuestionCreateResp(id=row["id"])
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Erro em POST /questions")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/questions/topics", response_model=QuestionsListResp)
+def list_questions_by_topics(
+    materia: Optional[str] = Query(None, description="Nome da matéria/disciplinar, ex: matematica"),
+    topics: Optional[str] = Query(None, description="CSV de tópicos. Ex: funcoes,matrizes,geometria"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    order_by: Literal["created_at", "id"] = Query("created_at"),
+    order: Literal["asc", "desc"] = Query("desc"),
+):
+    """
+    Lista questões filtrando por 'materia' e por múltiplos 'topics' (CSV),
+    fazendo OR ILIKE em question->>topic.
+    Retorno no mesmo formato do GET /questions padrão.
+    """
+    try:
+        sb = _sb()
+        q = sb.table("questions").select("*", count="exact")
+
+        # filtro por materia (se existir essa coluna na sua tabela)
+        if materia:
+            q = q.eq("materia", materia)
+
+        # monta OR por tópicos (question->>topic ILIKE %termo%)
+        if topics:
+            topic_terms = [t.strip() for t in topics.split(",") if t.strip()]
+            if topic_terms:
+                ors = ",".join([f"question->>topic.ilike.%{t}%" for t in topic_terms])
+                q = q.or_(ors)
+
+        # ordenação
+        try:
+            q = q.order(order_by, desc=(order == "desc"))
+        except Exception:
+            q = q.order("id", desc=(order == "desc"))
+
+        # paginação
+        if offset:
+            q = q.range(offset, offset + limit - 1)
+        else:
+            q = q.limit(limit)
+
+        res = q.execute()
+        items = res.data or []
+        total = getattr(res, "count", None)
+
+        return QuestionsListResp(
+            items=items,
+            total=total if isinstance(total, int) else len(items),
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        log.exception("Erro em GET /questions/topics")
+        raise HTTPException(status_code=500, detail=str(e))
+
