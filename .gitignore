@@ -1,0 +1,45 @@
+# Arquivos de ambiente (credenciais sensíveis)
+.env
+.env.local
+.env.*.local
+
+# Credenciais do Google Cloud
+*.json
+burnished-block-477703-s5-30e0a6bc0e5d.json
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ambientes virtuais
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
