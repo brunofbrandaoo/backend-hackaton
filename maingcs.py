@@ -312,7 +312,7 @@ def transformar_para_db_questoes(
             "subject_id": subject_id,
             "topic_id": None,  # Será necessário mapear o tópico posteriormente
             "difficulty": q.get("difficulty", "medium"),
-            "available": True,
+            "available": False,
             "question": question_jsonb
         }
         
