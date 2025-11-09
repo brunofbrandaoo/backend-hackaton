@@ -620,7 +620,7 @@ def gerar_e_salvar_questoes(req: GenBucketReq, created_by: str, subject_id: str,
     """
     try:
         # 1. Baixar e processar PDF
-        pdf = baixar_pdf_bucket(req.caminho_no_bucket, req.bucket or SUPABASE_BUCKET)
+        pdf = gcs_baixar_pdf_bytes(req.bucket, req.caminho_no_bucket)
         imgs = pdf_para_imagens(pdf, req.dpi, req.max_paginas, req.como_png, req.qualidade_jpeg)
         if not imgs:
             raise HTTPException(status_code=422, detail="Nenhuma página renderizada.")
