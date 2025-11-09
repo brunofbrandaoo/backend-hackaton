@@ -124,7 +124,6 @@ def gcs_upload_fileobj(
     blob_path: str,
     fileobj,
     content_type: Optional[str] = None,
-    make_public: bool = False,
     cache_control: Optional[str] = None,
 ) -> dict:
     """
@@ -142,11 +141,6 @@ def gcs_upload_fileobj(
         blob.cache_control = cache_control
         blob.patch()
 
-    public_url = None
-    if make_public:
-        blob.make_public()
-        public_url = blob.public_url
-
     return {
         "bucket": bucket_name,
         "path": blob_path,
@@ -154,7 +148,6 @@ def gcs_upload_fileobj(
         "content_type": content_type,
         "md5_hash": blob.md5_hash,
         "crc32c": blob.crc32c,
-        "public_url": public_url,
         "gs_uri": f"gs://{bucket_name}/{blob_path}",
     }
 
@@ -643,29 +636,6 @@ def insert_submission_and_feedback(
 # ==== SCHEMAS ====
 
 # --- SCHEMAS PARA MODERAÇÃO/VALIDAÇÃO DE QUESTÕES ---
-class QuestionOut(BaseModel):
-    id: Any
-    available: bool
-    subject_id: Optional[str] = None
-    created_by: Optional[str] = None
-    source_material_id: Optional[str] = None
-    difficulty: Optional[str] = None
-    question: Dict[str, Any]
-
-class ValidateQuestionReq(BaseModel):
-    correct_answer: str = Field(..., description="Letra A/B/C/D/E")
-    available: bool = True
-    # campos opcionais para ajustes pelo professor
-    statement: Optional[str] = None
-    alternatives: Optional[List[Dict[str, Any]]] = None  # [{letter, text}, ...]
-    difficulty: Optional[str] = None
-    topic: Optional[str] = None
-
-class PendingQueryParams(BaseModel):
-    subject_id: Optional[str] = None
-    created_by: Optional[str] = None
-    limit: int = Field(50, ge=1, le=200)
-    offset: int = Field(0, ge=0)
 
 class BasePDFParams(BaseModel):
     dpi: int = 200
@@ -704,6 +674,30 @@ class SaveReq(BaseModel):
     tabela: str = "conteudos"
     conteudo: str
     meta: Optional[dict] = None
+
+class QuestionOut(BaseModel):
+    id: Any
+    available: bool
+    subject_id: Optional[str] = None
+    created_by: Optional[str] = None
+    source_material_id: Optional[str] = None
+    difficulty: Optional[str] = None
+    question: Dict[str, Any]
+
+class ValidateQuestionReq(BaseModel):
+    correct_answer: str = Field(..., description="Letra A/B/C/D/E")
+    available: bool = True
+    # campos opcionais para ajustes pelo professor
+    statement: Optional[str] = None
+    alternatives: Optional[List[Dict[str, Any]]] = None  # [{letter, text}, ...]
+    difficulty: Optional[str] = None
+    topic: Optional[str] = None
+
+class PendingQueryParams(BaseModel):
+    subject_id: Optional[str] = None
+    created_by: Optional[str] = None
+    limit: int = Field(50, ge=1, le=200)
+    offset: int = Field(0, ge=0)
 
 class RespTexto(BaseModel):
     texto: str
@@ -967,7 +961,6 @@ async def upload_gcs_file(
     file: UploadFile = File(...),
     blob_path: str = Form(..., description="Caminho no bucket, ex: materiais/2025/prova.pdf"),
     bucket: Optional[str] = Form(None),
-    make_public: bool = Form(False),
     cache_control: Optional[str] = Form(None),
 ):
     """
@@ -986,7 +979,6 @@ async def upload_gcs_file(
             blob_path=blob_path,
             fileobj=file.file,
             content_type=file.content_type or "application/octet-stream",
-            make_public=make_public,
             cache_control=cache_control,
         )
         return {"ok": True, "file": result}
