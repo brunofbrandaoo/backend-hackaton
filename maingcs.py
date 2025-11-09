@@ -4,14 +4,17 @@ import io
 import json
 import base64
 import logging
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Any
+import re
 
 import fitz  # PyMuPDF
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from google import genai
 from dotenv import load_dotenv
+from datetime import timedelta
+from google.cloud.storage.blob import Blob
 
 load_dotenv()
 # ==== LOG ====
@@ -116,6 +119,46 @@ def baixar_pdf_bucket(caminho: str, bucket: str) -> bytes:
 def inline_img(b: bytes, mime: str) -> dict:
     return {"inline_data": {"mime_type": mime, "data": base64.b64encode(b).decode("utf-8")}}
 
+def gcs_upload_fileobj(
+    bucket_name: str,
+    blob_path: str,
+    fileobj,
+    content_type: Optional[str] = None,
+    make_public: bool = False,
+    cache_control: Optional[str] = None,
+) -> dict:
+    """
+    Faz upload de um arquivo (file-like) para o GCS.
+    """
+    cli = gcs_client()
+    bucket = cli.bucket(bucket_name)
+    blob: Blob = bucket.blob(blob_path)
+
+    # Para uploads grandes, pode ajustar chunk_size (ex.: 8 MB)
+    # blob.chunk_size = 8 * 1024 * 1024
+
+    blob.upload_from_file(fileobj, content_type=content_type, rewind=True)
+    if cache_control:
+        blob.cache_control = cache_control
+        blob.patch()
+
+    public_url = None
+    if make_public:
+        blob.make_public()
+        public_url = blob.public_url
+
+    return {
+        "bucket": bucket_name,
+        "path": blob_path,
+        "size": blob.size,
+        "content_type": content_type,
+        "md5_hash": blob.md5_hash,
+        "crc32c": blob.crc32c,
+        "public_url": public_url,
+        "gs_uri": f"gs://{bucket_name}/{blob_path}",
+    }
+
+
 # ==== PROMPTS ====
 def prompt_ocr() -> str:
     return (
@@ -158,7 +201,7 @@ def prompt_gerar_questoes(serie: str, qtd: int, ineditas: bool) -> str:
             "      ],\n"
             '      "correct_answer": "A",\n'
             '      "difficulty": "medium",\n'
-            '      "topic": "Nome do tópico"\n'
+            '      "topic": "Nome do assunto/conteúdo extraído do material para a questão"\n'
             "    }\n"
             "  ]\n"
             "}\n"
@@ -187,7 +230,7 @@ def prompt_gerar_questoes(serie: str, qtd: int, ineditas: bool) -> str:
         "      ],\n"
         '      "correct_answer": "A",\n'
         '      "difficulty": "medium",\n'
-        '      "topic": "Nome do tópico"\n'
+        '      "topic": "Nome do assunto/conteúdo extraído do material para a questão"\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -214,7 +257,7 @@ def prompt_ingestao_questoes() -> str:
         "      ],\n"
         '      "correct_answer": "A",\n'
         '      "difficulty": "medium",\n'
-        '      "topic": "Nome do tópico"\n'
+        '      "topic": "Nome do assunto/conteúdo da questão"\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -249,33 +292,74 @@ import uuid
 import re
 from datetime import datetime
 
+def _extract_json_objects(text: str) -> List[Dict[str, Any]]:
+    """
+    Varre o texto e extrai TODOS os objetos JSON bem-formados usando contagem de chaves.
+    Suporta casos em que o LLM devolve {..}{..} (vários objetos colados) ou
+    texto extra antes/depois.
+    """
+    # Remove cercas de código
+    t = text.strip()
+    # tira blocos ```json ... ``` ou ``` ... ```
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+
+    objs = []
+    stack = 0
+    start = None
+    for i, ch in enumerate(t):
+        if ch == "{":
+            if stack == 0:
+                start = i
+            stack += 1
+        elif ch == "}":
+            if stack > 0:
+                stack -= 1
+                if stack == 0 and start is not None:
+                    chunk = t[start:i+1]
+                    try:
+                        obj = json.loads(chunk)
+                        objs.append(obj)
+                    except json.JSONDecodeError:
+                        # tenta limpar vírgulas finais, etc.
+                        try:
+                            cleaned = re.sub(r",\s*}", "}", chunk)
+                            obj = json.loads(cleaned)
+                            objs.append(obj)
+                        except Exception:
+                            pass
+                    start = None
+    return objs
+
 def parsear_questoes_llm(texto_llm: str) -> dict:
     """
-    Parseia a saída do LLM em formato JSON e retorna um dicionário estruturado.
+    Lê a saída do LLM e retorna UM dicionário com "questions" mescladas.
+    Aceita múltiplos JSONs no texto e agrega tudo em {"questions": [...] }.
     """
-    try:
-        # Remover possíveis marcadores de código markdown
-        texto_limpo = texto_llm.strip()
-        if texto_limpo.startswith("```json"):
-            texto_limpo = texto_limpo[7:]
-        if texto_limpo.startswith("```"):
-            texto_limpo = texto_limpo[3:]
-        if texto_limpo.endswith("```"):
-            texto_limpo = texto_limpo[:-3]
-        texto_limpo = texto_limpo.strip()
-        
-        # Parsear JSON
-        dados = json.loads(texto_limpo)
-        return dados
-    except json.JSONDecodeError as e:
-        log.error(f"Erro ao parsear JSON: {e}")
-        log.error(f"Texto recebido: {texto_llm[:500]}...")
-        raise ValueError(f"Falha ao parsear JSON do LLM: {e}")
+    objetos = _extract_json_objects(texto_llm)
+    if not objetos:
+        # Última tentativa: talvez seja um único JSON válido com lixo lateral
+        try:
+            return json.loads(texto_llm.strip())
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Falha ao parsear JSON do LLM: {e}")
+
+    if len(objetos) == 1:
+        # normal: um único JSON
+        return objetos[0]
+
+    # múltiplos JSONs → mescla arrays de "questions"
+    merged = {"questions": []}
+    for obj in objetos:
+        qs = obj.get("questions", [])
+        if isinstance(qs, list):
+            merged["questions"].extend(qs)
+    return merged
 
 def transformar_para_db_questoes(
     texto_llm: str,
-    created_by: str,
-    subject_id: str,
+    created_by: Optional[str] = None,
+    subject_id: Optional[str] = None,
     source_material_id: Optional[str] = None,
 ) -> List[dict]:
     """
@@ -374,8 +458,47 @@ def salvar_texto(tabela: str, conteudo: str, meta: Optional[dict] = None) -> dic
         return {"sucesso": True, "data": data.data}
     except Exception as e:
         raise RuntimeError(f"Falha ao salvar no Supabase: {e}")
+    
+def _sb() -> Client:
+    return supabase_client()
+
+def get_question_by_id(qid: str) -> Optional[dict]:
+    sb = _sb()
+    res = sb.table("questions").select("*").eq("id", qid).limit(1).execute()
+    rows = res.data or []
+    return rows[0] if rows else None
+
+def normalize_correct_answer(letter: str) -> str:
+    return (letter or "").strip().upper()
+
 
 # ==== SCHEMAS ====
+
+# --- SCHEMAS PARA MODERAÇÃO/VALIDAÇÃO DE QUESTÕES ---
+class QuestionOut(BaseModel):
+    id: Any
+    available: bool
+    subject_id: Optional[str] = None
+    created_by: Optional[str] = None
+    source_material_id: Optional[str] = None
+    difficulty: Optional[str] = None
+    question: Dict[str, Any]
+
+class ValidateQuestionReq(BaseModel):
+    correct_answer: str = Field(..., description="Letra A/B/C/D/E")
+    available: bool = True
+    # campos opcionais para ajustes pelo professor
+    statement: Optional[str] = None
+    alternatives: Optional[List[Dict[str, Any]]] = None  # [{letter, text}, ...]
+    difficulty: Optional[str] = None
+    topic: Optional[str] = None
+
+class PendingQueryParams(BaseModel):
+    subject_id: Optional[str] = None
+    created_by: Optional[str] = None
+    limit: int = Field(50, ge=1, le=200)
+    offset: int = Field(0, ge=0)
+
 class BasePDFParams(BaseModel):
     dpi: int = 200
     max_paginas: Optional[int] = 20
@@ -424,13 +547,13 @@ class RespSalvar(BaseModel):
 
 class SalvarQuestoesReq(BaseModel):
     texto_llm: str
-    created_by: str = Field(..., description="UUID do professor")
-    subject_id: str = Field(..., description="UUID da matéria")
+    created_by: Optional[str] = Field(None, description="UUID do professor")
+    subject_id: Optional[str] = Field(None, description="UUID da matéria")
     source_material_id: Optional[str] = Field(None, description="UUID do material de origem")
 
 class SalvarMaterialReq(BaseModel):
-    teacher_id: str = Field(..., description="UUID do professor")
-    subject_id: str = Field(..., description="UUID da matéria")
+    teacher_id: Optional[str] = Field(None, description="UUID do professor")
+    subject_id: Optional[str] = Field(None, description="UUID da matéria")
     material_data: dict = Field(..., description="Dados do material em formato livre")
 
 class RespSalvarQuestoes(BaseModel):
@@ -614,7 +737,8 @@ def salvar_material_endpoint(req: SalvarMaterialReq):
 
 # ---------- GERAR E SALVAR QUESTÕES (FLUXO COMPLETO) ----------
 @app.post("/question-generation/complete", response_model=RespSalvarQuestoes)
-def gerar_e_salvar_questoes(req: GenBucketReq, created_by: str, subject_id: str, source_material_id: Optional[str] = None):
+def gerar_e_salvar_questoes(req: GenBucketReq, created_by: Optional[str] = None,
+    subject_id: Optional[str] = None, source_material_id: Optional[str] = None):
     """
     Fluxo completo: baixa PDF, gera questões com LLM e salva diretamente no banco.
     """
@@ -646,4 +770,202 @@ def gerar_e_salvar_questoes(req: GenBucketReq, created_by: str, subject_id: str,
         )
     except Exception as e:
         log.exception("Erro em /question-generation/complete")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/storage/gcs/upload")
+async def upload_gcs_file(
+    file: UploadFile = File(...),
+    blob_path: str = Form(..., description="Caminho no bucket, ex: materiais/2025/prova.pdf"),
+    bucket: Optional[str] = Form(None),
+    make_public: bool = Form(False),
+    cache_control: Optional[str] = Form(None),
+):
+    """
+    Upload direto de um arquivo (multipart/form-data) para o GCS.
+    """
+    try:
+        target_bucket = bucket or GCS_DEFAULT_BUCKET
+        if not target_bucket:
+            raise HTTPException(status_code=400, detail="Bucket do GCS não informado.")
+
+        # Lê o stream e envia
+        # Dica: para arquivos grandes, é melhor usar signed URL (abaixo)
+        file.file.seek(0)
+        result = gcs_upload_fileobj(
+            bucket_name=target_bucket,
+            blob_path=blob_path,
+            fileobj=file.file,
+            content_type=file.content_type or "application/octet-stream",
+            make_public=make_public,
+            cache_control=cache_control,
+        )
+        return {"ok": True, "file": result}
+    except Exception as e:
+        log.exception("Erro em /storage/gcs/upload")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/question-ingestion/complete/gcs", response_model=RespSalvarQuestoes)
+def ingestao_e_salvar_questoes_gcs(
+    req: GCSBaseReq,
+    created_by: Optional[str] = None,
+    subject_id: Optional[str] = None,
+    source_material_id: Optional[str] = None,
+):
+    """
+    Fluxo completo (GCS): baixa o PDF do GCS, extrai questões exatamente como no material (OCR),
+    parseia o JSON e salva na tabela 'questions'.
+    """
+    try:
+        # 1) Baixar PDF do GCS
+        bucket = req.bucket or GCS_DEFAULT_BUCKET
+        if not bucket:
+            raise HTTPException(status_code=400, detail="Bucket do GCS não informado.")
+        pdf = gcs_baixar_pdf_bytes(bucket, req.blob_path)
+
+        # 2) Renderizar em imagens
+        imgs = pdf_para_imagens(pdf, req.dpi, req.max_paginas, req.como_png, req.qualidade_jpeg)
+        if not imgs:
+            raise HTTPException(status_code=422, detail="Nenhuma página renderizada.")
+
+        # 3) Rodar OCR + extração com prompt de ingestão
+        mime = "image/png" if req.como_png else "image/jpeg"
+        texto_llm = gemini_processar_imagens(
+            imagens=imgs,
+            modelo=req.modelo,
+            prompt=prompt_ingestao_questoes(),
+            mime=mime,
+            tamanho_lote=req.tamanho_lote,
+        )
+
+        # 4) Transformar para schema do banco
+        questoes = transformar_para_db_questoes(
+            texto_llm=texto_llm,
+            created_by=created_by,
+            subject_id=subject_id,
+            source_material_id=source_material_id,
+        )
+
+        # 5) Salvar
+        resultado = salvar_questoes_db(questoes)
+
+        return RespSalvarQuestoes(
+            sucesso=True,
+            quantidade=len(questoes),
+            questoes=resultado.get("data", []),
+        )
+    except Exception as e:
+        log.exception("Erro em /question-ingestion/complete/gcs")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/questions/pending", response_model=List[QuestionOut])
+def list_pending_questions(
+    subject_id: Optional[str] = Query(None),
+    created_by: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Lista questões que ainda NÃO estão disponíveis para alunos (available = false).
+    Suporta filtros por subject_id e created_by, além de paginação (limit/offset).
+    """
+    try:
+        sb = _sb()
+        q = sb.table("questions").select("*").eq("available", False)
+
+        if subject_id:
+            q = q.eq("subject_id", subject_id)
+        if created_by:
+            q = q.eq("created_by", created_by)
+
+        # ordena por criação desc (se tiver created_at); senão por id desc
+        try:
+            q = q.order("created_at", desc=True)
+        except Exception:
+            q = q.order("id", desc=True)
+
+        if offset:
+            q = q.range(offset, offset + limit - 1)
+        else:
+            q = q.limit(limit)
+
+        res = q.execute()
+        return (res.data or [])
+    except Exception as e:
+        log.exception("Erro em /questions/pending")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/questions/{question_id}", response_model=QuestionOut)
+def validate_question(question_id: str, body: ValidateQuestionReq):
+    """
+    Professor valida/ajusta uma questão:
+    - define 'question.correct_answer'
+    - (opcional) ajusta enunciado, alternativas, difficulty, topic
+    - define 'available' (default True)
+    """
+    try:
+        # 1) Busca atual
+        row = get_question_by_id(question_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Questão não encontrada.")
+
+        qobj = row.get("question") or {}
+        # 2) Normaliza e valida a resposta
+        corr = normalize_correct_answer(body.correct_answer)
+        if corr not in {"A", "B", "C", "D", "E"}:
+            raise HTTPException(status_code=422, detail="correct_answer deve ser A, B, C, D ou E.")
+
+        # 3) Aplica ajustes opcionais
+        if body.statement is not None:
+            qobj["statement"] = body.statement
+        if body.alternatives is not None:
+            # valida formato mínimo
+            if not isinstance(body.alternatives, list) or len(body.alternatives) < 2:
+                raise HTTPException(status_code=422, detail="alternatives deve ser lista com 2+ itens.")
+            qobj["alternatives"] = body.alternatives
+        if body.topic is not None:
+            # topic pode morar dentro de question.metadata ou na raiz do question; segue seu prompt:
+            qobj["topic"] = body.topic
+
+        qobj["correct_answer"] = corr
+
+        # 4) Difficulty opcional (na coluna de linha, não só no JSON)
+        new_difficulty = body.difficulty if body.difficulty is not None else row.get("difficulty")
+
+        # 5) Update no Supabase
+        sb = _sb()
+        updated = sb.table("questions").update({
+            "question": qobj,
+            "available": bool(body.available),
+            "difficulty": new_difficulty
+        }).eq("id", question_id).execute()
+
+        data = (updated.data or [])
+        if not data:
+            raise HTTPException(status_code=500, detail="Falha ao atualizar a questão.")
+        return data[0]
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Erro em PATCH /questions/{id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/questions/{question_id}")
+def delete_question(question_id: str):
+    """
+    Remove uma questão (quando está mal formulada ou sem resposta correta).
+    """
+    try:
+        # opcional: garantir que existe antes
+        row = get_question_by_id(question_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Questão não encontrada.")
+
+        sb = _sb()
+        res = sb.table("questions").delete().eq("id", question_id).execute()
+        count = len(res.data or [])
+        return {"deleted": count, "id": question_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Erro em DELETE /questions/{id}")
         raise HTTPException(status_code=500, detail=str(e))
