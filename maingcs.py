@@ -15,6 +15,7 @@ from google import genai
 from dotenv import load_dotenv
 from datetime import timedelta, timezone, datetime
 from google.cloud.storage.blob import Blob
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 # ==== LOG ====
@@ -750,11 +751,25 @@ class QuestionsListResp(BaseModel):
     limit: int
     offset: int
 
+class SubjectsListResp(BaseModel):
+    items: List[Dict[str, Any]]
+    total: int
+    limit: int
+    offset: int
+
 
 # ==== FASTAPI APP ====
 app = FastAPI(
     title="EducaAI API — OCR, Geração e Ingestão de Questões (Supabase + GCS)",
     version="4.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # em produção, especifique os domínios permitidos
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.get("/healthcheck")
@@ -1308,3 +1323,58 @@ def list_questions(
     except Exception as e:
         log.exception("Erro em GET /questions")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/subjects", response_model=SubjectsListResp)
+def list_subjects(
+    search: Optional[str] = Query(None, description="Busca por nome (ilike) ou no JSON da linha"),
+    order_by: Literal["name", "created_at", "id"] = Query("name"),
+    order: Literal["asc", "desc"] = Query("asc"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Lista matérias/disciplinas (subjects) com busca, ordenação e paginação.
+
+    Parâmetros:
+      - search: termo de busca (ilike) em 'name' e no JSON completo
+      - order_by: name | created_at | id (default name)
+      - order: asc | desc (default asc)
+      - limit / offset: paginação
+    """
+    try:
+        sb = _sb()
+
+        # select com count para paginação
+        q = sb.table("subjects").select("*", count="exact")
+
+        # busca (tenta em name e fallback no JSON inteiro)
+        if search:
+            pattern = f"%{search}%"
+            q = q.or_(f"name.ilike.{pattern},subjects.ilike.{pattern}")
+
+        # ordenação segura
+        try:
+            q = q.order(order_by, desc=(order == "desc"))
+        except Exception:
+            q = q.order("id", desc=(order == "desc"))
+
+        # paginação
+        if offset:
+            q = q.range(offset, offset + limit - 1)
+        else:
+            q = q.limit(limit)
+
+        res = q.execute()
+        items = res.data or []
+        total = getattr(res, "count", None)
+
+        return SubjectsListResp(
+            items=items,
+            total=total if isinstance(total, int) else len(items),
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        log.exception("Erro em GET /subjects")
+        raise HTTPException(status_code=500, detail=str(e))
+    
