@@ -11,7 +11,9 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from google import genai
+from dotenv import load_dotenv
 
+load_dotenv()
 # ==== LOG ====
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("educa-ai")
