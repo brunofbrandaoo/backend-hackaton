@@ -1,9 +1,9 @@
-# syntax=docker/dockerfile:1
+# ...existing code...
 FROM python:3.12-slim
 
 WORKDIR /app
 
-# Dependências mínimas úteis
+# Dependências mínimas úteis (build-essential para compilar wheels se necessário)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
  && rm -rf /var/lib/apt/lists/*
@@ -17,4 +17,6 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 
 EXPOSE 8080
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+
+# use shell form para expansão de ${PORT}; a referência do módulo foi alterada para maingcs:app
+CMD ["sh", "-c", "uvicorn maingcs:app --host 0.0.0.0 --port ${PORT:-8080}"]
