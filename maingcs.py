@@ -145,9 +145,24 @@ def prompt_gerar_questoes(serie: str, qtd: int, ineditas: bool) -> str:
             "- O enunciado deve exigir interpretação e análise, não apenas memorização.\n"
             "- As alternativas devem ser plausíveis e testar raciocínio.\n"
             "- Linguagem formal, clara, em português padrão. Uma resposta correta por questão.\n\n"
-            "Formato obrigatório de saída:\n"
-            "1) Pergunta\nA) ...\nB) ...\nC) ...\nD) ...\nCorreta: <A|B|C|D>\n"
-            "Sem explicações adicionais."
+            "Formato obrigatório de saída (JSON):\n"
+            "{\n"
+            '  "questions": [\n'
+            "    {\n"
+            '      "statement": "Enunciado da questão",\n'
+            '      "alternatives": [\n'
+            '        {"letter": "A", "text": "Alternativa A"},\n'
+            '        {"letter": "B", "text": "Alternativa B"},\n'
+            '        {"letter": "C", "text": "Alternativa C"},\n'
+            '        {"letter": "D", "text": "Alternativa D"}\n'
+            "      ],\n"
+            '      "correct_answer": "A",\n'
+            '      "difficulty": "medium",\n'
+            '      "topic": "Nome do tópico"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "Retorne APENAS o JSON, sem explicações adicionais."
         )
         if ineditas:
             base += "\nAs questões devem ser INÉDITAS; não copie trechos literais do material."
@@ -159,9 +174,24 @@ def prompt_gerar_questoes(serie: str, qtd: int, ineditas: bool) -> str:
         "Primeiro, faça OCR e compreenda o conteúdo. "
         f"Depois, crie {qtd} questões de múltipla escolha (4 alternativas) adequadas à série, "
         "respeitando o nível cognitivo e linguístico do aluno.\n\n"
-        "Formato obrigatório:\n"
-        "1) Pergunta\nA) ...\nB) ...\nC) ...\nD) ...\nCorreta: <A|B|C|D>\n"
-        "Sem explicações adicionais."
+        "Formato obrigatório de saída (JSON):\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "statement": "Enunciado da questão",\n'
+        '      "alternatives": [\n'
+        '        {"letter": "A", "text": "Alternativa A"},\n'
+        '        {"letter": "B", "text": "Alternativa B"},\n'
+        '        {"letter": "C", "text": "Alternativa C"},\n'
+        '        {"letter": "D", "text": "Alternativa D"}\n'
+        "      ],\n"
+        '      "correct_answer": "A",\n'
+        '      "difficulty": "medium",\n'
+        '      "topic": "Nome do tópico"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Retorne APENAS o JSON, sem explicações adicionais."
     )
     if ineditas:
         base += "\nAs questões devem ser INÉDITAS; não copie trechos literais do material."
@@ -171,14 +201,24 @@ def prompt_ingestao_questoes() -> str:
     return (
         "Você receberá páginas de um PDF contendo questões. Faça OCR e extraia as questões exatamente como estão.\n"
         "Inclua enunciado, alternativas e gabarito se disponível.\n"
-        "Saída no formato JSONL, uma linha por questão, no seguinte schema:\n"
-        "{"
-        "\"numero\": <int>, "
-        "\"enunciado\": \"texto\", "
-        "\"alternativas\": [\"A) ...\", \"B) ...\", \"C) ...\", \"D) ...\"], "
-        "\"correta\": \"A|B|C|D\" ou null"
+        "Saída no formato JSON:\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "statement": "Enunciado da questão",\n'
+        '      "alternatives": [\n'
+        '        {"letter": "A", "text": "Alternativa A"},\n'
+        '        {"letter": "B", "text": "Alternativa B"},\n'
+        '        {"letter": "C", "text": "Alternativa C"},\n'
+        '        {"letter": "D", "text": "Alternativa D"}\n'
+        "      ],\n"
+        '      "correct_answer": "A",\n'
+        '      "difficulty": "medium",\n'
+        '      "topic": "Nome do tópico"\n'
+        "    }\n"
+        "  ]\n"
         "}\n"
-        "Sem comentários adicionais."
+        "Retorne APENAS o JSON, sem comentários adicionais."
     )
 
 # ==== GEMINI PROCESS ====
@@ -204,7 +244,128 @@ def gemini_processar_imagens(
             saidas.append(f"[ERRO no lote {i//tamanho_lote + 1}: {e}]")
     return "\n\n".join(saidas)
 
-# ==== SALVAR (Supabase DB) ====
+# ==== PARSEAR SAÍDA DO LLM ====
+import uuid
+import re
+from datetime import datetime
+
+def parsear_questoes_llm(texto_llm: str) -> dict:
+    """
+    Parseia a saída do LLM em formato JSON e retorna um dicionário estruturado.
+    """
+    try:
+        # Remover possíveis marcadores de código markdown
+        texto_limpo = texto_llm.strip()
+        if texto_limpo.startswith("```json"):
+            texto_limpo = texto_limpo[7:]
+        if texto_limpo.startswith("```"):
+            texto_limpo = texto_limpo[3:]
+        if texto_limpo.endswith("```"):
+            texto_limpo = texto_limpo[:-3]
+        texto_limpo = texto_limpo.strip()
+        
+        # Parsear JSON
+        dados = json.loads(texto_limpo)
+        return dados
+    except json.JSONDecodeError as e:
+        log.error(f"Erro ao parsear JSON: {e}")
+        log.error(f"Texto recebido: {texto_llm[:500]}...")
+        raise ValueError(f"Falha ao parsear JSON do LLM: {e}")
+
+def transformar_para_db_questoes(
+    texto_llm: str,
+    created_by: str,
+    subject_id: str,
+    source_material_id: Optional[str] = None,
+) -> List[dict]:
+    """
+    Transforma a saída do LLM em formato JSON para o schema da tabela 'questions'.
+    
+    Args:
+        texto_llm: Texto JSON retornado pelo LLM
+        created_by: UUID do professor que criou
+        subject_id: UUID da matéria
+        source_material_id: UUID do material de origem (opcional)
+    
+    Returns:
+        Lista de dicionários prontos para inserção na tabela 'questions'
+    """
+    dados = parsear_questoes_llm(texto_llm)
+    questoes_db = []
+    
+    for q in dados.get("questions", []):
+        # Montar o JSONB da questão no formato esperado pelo banco
+        question_jsonb = {
+            "statement": q.get("statement", ""),
+            "alternatives": q.get("alternatives", []),
+            "correct_answer": q.get("correct_answer", ""),
+            "metadata": {
+                "created_from_llm": True,
+                "raw_response": q
+            }
+        }
+        
+        # Criar registro para o banco
+        questao_db = {
+            "source_material_id": source_material_id,
+            "created_by": created_by,
+            "subject_id": subject_id,
+            "topic_id": None,  # Será necessário mapear o tópico posteriormente
+            "difficulty": q.get("difficulty", "medium"),
+            "available": True,
+            "question": question_jsonb
+        }
+        
+        questoes_db.append(questao_db)
+    
+    return questoes_db
+
+def salvar_material_db(
+    teacher_id: str,
+    subject_id: str,
+    material_data: dict,
+) -> dict:
+    """
+    Salva material na tabela 'materials' do banco de dados.
+    
+    Args:
+        teacher_id: UUID do professor
+        subject_id: UUID da matéria
+        material_data: Dados do material (será salvo como JSONB)
+    
+    Returns:
+        Dicionário com o resultado da inserção
+    """
+    sb = supabase_client()
+    payload = {
+        "teacher_id": teacher_id,
+        "subject_id": subject_id,
+        "material": material_data
+    }
+    try:
+        data = sb.table("materials").insert(payload).execute()
+        return {"sucesso": True, "data": data.data}
+    except Exception as e:
+        raise RuntimeError(f"Falha ao salvar material no Supabase: {e}")
+
+def salvar_questoes_db(questoes: List[dict]) -> dict:
+    """
+    Salva questões na tabela 'questions' do banco de dados.
+    
+    Args:
+        questoes: Lista de dicionários com os dados das questões
+    
+    Returns:
+        Dicionário com o resultado da inserção
+    """
+    sb = supabase_client()
+    try:
+        data = sb.table("questions").insert(questoes).execute()
+        return {"sucesso": True, "data": data.data, "quantidade": len(questoes)}
+    except Exception as e:
+        raise RuntimeError(f"Falha ao salvar questões no Supabase: {e}")
+
+# ==== SALVAR (Supabase DB) - LEGACY ====
 def salvar_texto(tabela: str, conteudo: str, meta: Optional[dict] = None) -> dict:
     sb = supabase_client()
     payload = {"conteudo": conteudo, "meta": meta or {}}
@@ -260,6 +421,22 @@ class RespTexto(BaseModel):
 class RespSalvar(BaseModel):
     sucesso: bool
     data: Optional[dict] = None
+
+class SalvarQuestoesReq(BaseModel):
+    texto_llm: str
+    created_by: str = Field(..., description="UUID do professor")
+    subject_id: str = Field(..., description="UUID da matéria")
+    source_material_id: Optional[str] = Field(None, description="UUID do material de origem")
+
+class SalvarMaterialReq(BaseModel):
+    teacher_id: str = Field(..., description="UUID do professor")
+    subject_id: str = Field(..., description="UUID da matéria")
+    material_data: dict = Field(..., description="Dados do material em formato livre")
+
+class RespSalvarQuestoes(BaseModel):
+    sucesso: bool
+    quantidade: int
+    questoes: List[dict] = []
 
 # ==== FASTAPI APP ====
 app = FastAPI(
@@ -389,4 +566,84 @@ def salvar_conteudo(req: SaveReq):
         return RespSalvar(sucesso=True, data=res)
     except Exception as e:
         log.exception("Erro em /content-storage/save")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- SALVAR QUESTÕES NO BANCO ----------
+@app.post("/questions/save", response_model=RespSalvarQuestoes)
+def salvar_questoes_endpoint(req: SalvarQuestoesReq):
+    """
+    Parseia a saída JSON do LLM e salva as questões na tabela 'questions'.
+    """
+    try:
+        # Transformar saída do LLM para formato do banco
+        questoes = transformar_para_db_questoes(
+            texto_llm=req.texto_llm,
+            created_by=req.created_by,
+            subject_id=req.subject_id,
+            source_material_id=req.source_material_id
+        )
+        
+        # Salvar no banco
+        resultado = salvar_questoes_db(questoes)
+        
+        return RespSalvarQuestoes(
+            sucesso=True,
+            quantidade=len(questoes),
+            questoes=resultado.get("data", [])
+        )
+    except Exception as e:
+        log.exception("Erro em /questions/save")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- SALVAR MATERIAL NO BANCO ----------
+@app.post("/materials/save", response_model=RespSalvar)
+def salvar_material_endpoint(req: SalvarMaterialReq):
+    """
+    Salva material na tabela 'materials'.
+    """
+    try:
+        resultado = salvar_material_db(
+            teacher_id=req.teacher_id,
+            subject_id=req.subject_id,
+            material_data=req.material_data
+        )
+        return RespSalvar(sucesso=True, data=resultado.get("data"))
+    except Exception as e:
+        log.exception("Erro em /materials/save")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ---------- GERAR E SALVAR QUESTÕES (FLUXO COMPLETO) ----------
+@app.post("/question-generation/complete", response_model=RespSalvarQuestoes)
+def gerar_e_salvar_questoes(req: GenBucketReq, created_by: str, subject_id: str, source_material_id: Optional[str] = None):
+    """
+    Fluxo completo: baixa PDF, gera questões com LLM e salva diretamente no banco.
+    """
+    try:
+        # 1. Baixar e processar PDF
+        pdf = baixar_pdf_bucket(req.caminho_no_bucket, req.bucket or SUPABASE_BUCKET)
+        imgs = pdf_para_imagens(pdf, req.dpi, req.max_paginas, req.como_png, req.qualidade_jpeg)
+        if not imgs:
+            raise HTTPException(status_code=422, detail="Nenhuma página renderizada.")
+        
+        # 2. Gerar questões com LLM
+        mime = "image/png" if req.como_png else "image/jpeg"
+        prompt = prompt_gerar_questoes(req.serie, req.qtd_questoes, req.ineditas)
+        texto_llm = gemini_processar_imagens(imgs, req.modelo, prompt, mime, req.tamanho_lote)
+        
+        # 3. Transformar e salvar no banco
+        questoes = transformar_para_db_questoes(
+            texto_llm=texto_llm,
+            created_by=created_by,
+            subject_id=subject_id,
+            source_material_id=source_material_id
+        )
+        resultado = salvar_questoes_db(questoes)
+        
+        return RespSalvarQuestoes(
+            sucesso=True,
+            quantidade=len(questoes),
+            questoes=resultado.get("data", [])
+        )
+    except Exception as e:
+        log.exception("Erro em /question-generation/complete")
         raise HTTPException(status_code=500, detail=str(e))
