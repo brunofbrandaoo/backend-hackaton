@@ -1229,6 +1229,7 @@ def grade_from_gcs(req: GradeReqGCS):
 @app.get("/questions", response_model=QuestionsListResp)
 def list_questions(
     subject_id: Optional[str] = Query(None),
+    materia: Optional[str] = Query(None),
     created_by: Optional[str] = Query(None),
     available: Optional[bool] = Query(None),
     difficulty: Optional[str] = Query(None),
@@ -1262,6 +1263,8 @@ def list_questions(
             q = q.eq("available", available)
         if subject_id:
             q = q.eq("subject_id", subject_id)
+        if materia:
+            q = q.eq("materia", materia)
         if created_by:
             q = q.eq("created_by", created_by)
         if difficulty:
