@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from supabase import create_client, Client
 from google import genai
 from dotenv import load_dotenv
-from datetime import timedelta
+from datetime import timedelta, timezone, datetime
 from google.cloud.storage.blob import Blob
 
 load_dotenv()
@@ -264,6 +264,25 @@ def prompt_ingestao_questoes() -> str:
         "Retorne APENAS o JSON, sem comentários adicionais."
     )
 
+def prompt_ocr_respostas() -> str:
+    return (
+        "Você receberá páginas digitalizadas de uma prova objetiva (múltipla escolha). "
+        "Identifique as respostas marcadas pelo aluno e, se houver, o gabarito da prova impresso.\n\n"
+        "Regras de leitura:\n"
+        "- Considere marcações nítidas (bolha preenchida, X, marca forte). Ignore borrões leves.\n"
+        "- Cada questão tem alternativas A, B, C, D e pode ter a letra E também.\n"
+        "- Se houver uma área de gabarito com respostas do aluno, ela prevalece.\n"
+        "- Se houver gabarito oficial impresso (respostas corretas), extraia-o também.\n"
+        "- Retorne apenas um JSON único, sem texto extra.\n\n"
+        "Formato do JSON:\n"
+        "{\n"
+        '  "student": {"name": "Nome legível ou null", "class": "Turma/Série ou null"},\n'
+        '  "answers": [{"number": 1, "selected": "A"}],\n'
+        '  "answer_key": [{"number": 1, "correct": "B"}]\n'
+        "}"
+    )
+
+
 # ==== GEMINI PROCESS ====
 def gemini_processar_imagens(
     imagens: List[bytes],
@@ -471,6 +490,155 @@ def get_question_by_id(qid: str) -> Optional[dict]:
 def normalize_correct_answer(letter: str) -> str:
     return (letter or "").strip().upper()
 
+def _norm_letter(x: Optional[str]) -> Optional[str]:
+    if not x: return None
+    x = x.strip().upper()
+    return x if x in {"A","B","C","D"} else None
+
+def _answers_by_number(obj: dict) -> Dict[int, str]:
+    out = {}
+    for a in obj.get("answers", []) or []:
+        try:
+            n = int(a.get("number"))
+        except Exception:
+            continue
+        sel = _norm_letter(a.get("selected"))
+        if sel:
+            out[n] = sel
+    return out
+
+def _answerkey_by_number(obj: dict) -> Dict[int, str]:
+    out = {}
+    for a in obj.get("answer_key", []) or []:
+        try:
+            n = int(a.get("number"))
+        except Exception:
+            continue
+        cor = _norm_letter(a.get("correct"))
+        if cor:
+            out[n] = cor
+    return out
+
+def get_correct_by_question_ids(question_ids: List[str]) -> Dict[int, str]:
+    if not question_ids:
+        return {}
+    sb = supabase_client()
+    res = sb.table("questions").select("id, question").in_("id", question_ids).execute()
+    rows = res.data or []
+    qmap = {r["id"]: (r.get("question") or {}) for r in rows}
+    out = {}
+    for idx, qid in enumerate(question_ids, start=1):
+        qobj = qmap.get(qid, {})
+        correct = _norm_letter((qobj or {}).get("correct_answer"))
+        if correct:
+            out[idx] = correct
+    return out
+
+def get_correct_by_exam(exam_id: str) -> Dict[int, str]:
+    sb = supabase_client()
+    eq = sb.table("exam_questions").select("question_id, position").eq("exam_id", exam_id).order("position").execute()
+    items = eq.data or []
+    qids = [it["question_id"] for it in items]
+    if not qids:
+        return {}
+    res = sb.table("questions").select("id, question").in_("id", qids).execute()
+    rows = res.data or []
+    qmap = {r["id"]: (r.get("question") or {}) for r in rows}
+    out = {}
+    for it in items:
+        pos = int(it["position"])
+        qid = it["question_id"]
+        correct = _norm_letter((qmap.get(qid) or {}).get("correct_answer"))
+        if correct:
+            out[pos] = correct
+    return out
+
+def compute_grade(marked: Dict[int, str], correct: Dict[int, str]) -> dict:
+    numbers = sorted(set(marked.keys()) | set(correct.keys()))
+    results = []
+    correct_count = 0
+    for n in numbers:
+        sel = marked.get(n)
+        cor = correct.get(n)
+        is_right = (sel is not None and cor is not None and sel == cor)
+        if is_right:
+            correct_count += 1
+        results.append({"number": n, "selected": sel, "correct": cor, "is_correct": is_right})
+    total = len(correct) if correct else len(numbers)
+    pct = (correct_count / total) if total else 0.0
+    return {"total_questions": total, "correct": correct_count, "percentage": round(pct * 100, 2), "details": results}
+
+def _answers_json_from_marked(marked: Dict[int, str]) -> List[dict]:
+    return [{"number": n, "selected": sel} for n, sel in sorted(marked.items(), key=lambda x: x[0])]
+
+def _needs_review_from_grade(grade: dict) -> bool:
+    for d in grade.get("details", []):
+        if d.get("selected") is None or d.get("correct") is None:
+            return True
+    return False
+
+def insert_submission_and_feedback(
+    quiz_id: str,
+    student_id: str,
+    marked: Dict[int, str],
+    grade: dict,
+    raw_ocr: dict,
+    source: dict,
+    student_name: Optional[str] = None,
+    student_class: Optional[str] = None,
+    subject_name: Optional[str] = None,
+    status: str = "graded",
+) -> dict:
+    """
+    submissions.answers:
+    {
+      "student": {"name": "...", "class": "..."},
+      "subject": {"name": "..."},
+      "responses": [{"number":1,"selected":"A"}, ...]
+    }
+    """
+    sb = supabase_client()
+    responses_json = _answers_json_from_marked(marked)
+    now = datetime.now(timezone.utc).isoformat()
+
+    answers_payload = {
+        "student": {"name": student_name, "class": student_class},
+        "subject": {"name": subject_name},
+        "responses": responses_json,
+    }
+
+    sub_payload = {
+        "quiz_id": quiz_id,
+        "student_id": student_id,
+        "answers": answers_payload,
+        "started_at": None,
+        "submitted_at": now,
+        "status": status,
+    }
+    sub_res = sb.table("submissions").insert(sub_payload).select("*").execute()
+    submission = (sub_res.data or [None])[0]
+    if not submission:
+        raise RuntimeError("Falha ao criar submission.")
+
+    fb_payload = {
+        "submission_id": submission["id"],
+        "feedback": {
+            "grade": grade,
+            "raw_ocr": raw_ocr,
+            "source": source,
+            "student": {"name": student_name, "class": student_class},
+            "subject": {"name": subject_name},
+        },
+        "needs_review": _needs_review_from_grade(grade),
+    }
+    fb_res = sb.table("feedback").insert(fb_payload).select("*").execute()
+    fb = (fb_res.data or [None])[0]
+    if not fb:
+        raise RuntimeError("Falha ao criar feedback.")
+
+    return {"submission": submission, "feedback": fb}
+
+
 
 # ==== SCHEMAS ====
 
@@ -560,6 +728,28 @@ class RespSalvarQuestoes(BaseModel):
     sucesso: bool
     quantidade: int
     questoes: List[dict] = []
+
+class GradeBase(BaseModel):
+    exam_id: Optional[str] = Field(None, description="Se informado, usa exam_questions para buscar o gabarito.")
+    question_id_order: Optional[List[str]] = Field(None, description="Se não tiver exam_id, usa esta ordem para buscar correct_answer em questions.")
+    quiz_id: Optional[str] = Field(None, description="Obrigatório se save_submission=true")
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    student_class: Optional[str] = None
+    subject_name: Optional[str] = None
+    save_submission: bool = True
+
+class GradeReqBucket(GradeBase, OCRBucketReq): ...
+class GradeReqGCS(GradeBase, GCSBaseReq): ...
+
+class GradeResp(BaseModel):
+    student: Optional[dict] = None
+    grade: dict
+    marked: Dict[int, str]
+    correct: Dict[int, str]
+    saved: bool = False
+    submission: Optional[dict] = None
+
 
 # ==== FASTAPI APP ====
 app = FastAPI(
@@ -968,4 +1158,72 @@ def delete_question(question_id: str):
         raise
     except Exception as e:
         log.exception("Erro em DELETE /questions/{id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/grading/grade/gcs", response_model=GradeResp)
+def grade_from_gcs(req: GradeReqGCS):
+    try:
+        bucket = req.bucket or GCS_DEFAULT_BUCKET
+        if not bucket:
+            raise HTTPException(status_code=400, detail="Bucket do GCS não informado.")
+        pdf = gcs_baixar_pdf_bytes(bucket, req.blob_path)
+
+        imgs = pdf_para_imagens(pdf, req.dpi, req.max_paginas, req.como_png, req.qualidade_jpeg)
+        if not imgs:
+            raise HTTPException(status_code=422, detail="Nenhuma página renderizada.")
+        mime = "image/png" if req.como_png else "image/jpeg"
+
+        texto_llm = gemini_processar_imagens(
+            imagens=imgs, modelo=req.modelo, prompt=prompt_ocr_respostas(),
+            mime=mime, tamanho_lote=req.tamanho_lote,
+        )
+        raw = parsear_questoes_llm(texto_llm)
+        marked = _answers_by_number(raw)
+        if not marked:
+            raise HTTPException(status_code=422, detail="Não foi possível identificar respostas marcadas.")
+
+        correct = {}
+        if req.exam_id:
+            correct = get_correct_by_exam(req.exam_id)
+        elif req.question_id_order:
+            correct = get_correct_by_question_ids(req.question_id_order)
+        if not correct:
+            correct = _answerkey_by_number(raw)
+        if not correct:
+            raise HTTPException(status_code=422, detail="Gabarito correto não encontrado.")
+
+        grade = compute_grade(marked, correct)
+
+        saved = False
+        submission = None
+        if req.save_submission:
+            if not req.quiz_id or not req.student_id:
+                raise HTTPException(status_code=400, detail="quiz_id e student_id são obrigatórios quando save_submission=true.")
+            result = insert_submission_and_feedback(
+                quiz_id=req.quiz_id,
+                student_id=req.student_id,
+                marked=marked,
+                grade=grade,
+                raw_ocr=raw,
+                source={"type": "gcs", "bucket": bucket, "path": req.blob_path},
+                student_name=req.student_name or (raw.get("student") or {}).get("name"),
+                student_class=req.student_class or (raw.get("student") or {}).get("class"),
+                subject_name=req.subject_name,
+                status="graded",
+            )
+            saved = True
+            submission = result
+
+        return GradeResp(
+            student=raw.get("student"),
+            grade=grade,
+            marked=marked,
+            correct=correct,
+            saved=saved,
+            submission=submission
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("Erro em /grading/grade/gcs")
         raise HTTPException(status_code=500, detail=str(e))

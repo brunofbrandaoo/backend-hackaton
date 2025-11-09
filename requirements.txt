@@ -7,3 +7,4 @@ supabase==2.24.0
 google-genai==1.49.0
 google-cloud-storage==3.5.0
 requests==2.32.5
+regex==2025.11.3
